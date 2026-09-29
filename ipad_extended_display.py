@@ -85,14 +85,45 @@ def start_hotspot(cfg):
         subprocess.run(["nmcli", "connection", "modify", HOTSPOT_CON_NAME,
                         "802-11-wireless-security.pmf", "1"])
         subprocess.run(["nmcli", "connection", "up", HOTSPOT_CON_NAME])
+    # Never let NetworkManager bring the hotspot back up on its own — an
+    # AP-mode profile is always "available", so with autoconnect on NM can
+    # pick it again whenever the Wi-Fi device reconnects.
+    subprocess.run(["nmcli", "connection", "modify", HOTSPOT_CON_NAME,
+                    "connection.autoconnect", "no"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _hotspot_active():
+    active = subprocess.run(["nmcli", "-g", "NAME", "connection", "show", "--active"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True).stdout.splitlines()
+    return HOTSPOT_CON_NAME in active
 
 
 def stop_hotspot(cfg):
+    """Take the hotspot connection down and hand the Wi-Fi device back to
+    NetworkManager's normal autoconnect.
+
+    The old approach (device disconnect + device connect) let NM choose
+    "the best available connection" on reconnect, which was sometimes the
+    hotspot profile itself — so the hotspot came straight back up. Instead,
+    deactivate the hotspot profile by name and verify it's actually gone.
+    """
     iface = cfg["interface"]
-    subprocess.run(["nmcli", "device", "disconnect", iface],
+    subprocess.run(["nmcli", "connection", "modify", HOTSPOT_CON_NAME,
+                    "connection.autoconnect", "no"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["nmcli", "device", "connect", iface],
+    for _attempt in range(5):
+        subprocess.run(["nmcli", "connection", "down", HOTSPOT_CON_NAME],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not _hotspot_active():
+            break
+        time.sleep(0.5)
+    # Clear any autoconnect block left by the "device disconnect" in
+    # start_hotspot so NM rejoins the usual Wi-Fi network by itself.
+    subprocess.run(["nmcli", "device", "set", iface, "autoconnect", "yes"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return not _hotspot_active()
 
 
 def load_sizes():
@@ -417,6 +448,7 @@ class Window(Gtk.ApplicationWindow):
         self.set_child(box)
 
         self.hotspot = load_hotspot()
+        self.hotspot_up = False
 
         self.hotspot_check = Gtk.CheckButton(label="Start a Wi-Fi hotspot",
                                              active=self.hotspot["enabled"])
@@ -540,11 +572,29 @@ class Window(Gtk.ApplicationWindow):
     def _on_start(self, _button):
         if self.hotspot["enabled"]:
             start_hotspot(self.hotspot)
+            self.hotspot_up = True
         width, height = self._selected_size()
-        self.controller.start(width, height, self.position_combo.get_active_id())
+        try:
+            self.controller.start(width, height, self.position_combo.get_active_id())
+        except Exception as exc:
+            self._teardown_hotspot()
+            self.status_label.set_label(f"Failed to start: {exc}")
+            raise
 
     def _on_stop(self, _button):
         self.controller.stop()
+        # Covers the case where the controller wasn't "running" (so it
+        # never fired a state change) but the hotspot was still started.
+        self._teardown_hotspot()
+
+    def _teardown_hotspot(self):
+        """Stop the hotspot if we started it. Returns a status suffix."""
+        if not self.hotspot_up:
+            return ""
+        self.hotspot_up = False
+        if stop_hotspot(self.hotspot):
+            return f" Wi-Fi '{self.hotspot['ssid']}' removed."
+        return f" Wi-Fi '{self.hotspot['ssid']}' could NOT be stopped — check nmcli."
 
     def _on_state_change(self, running, status_text):
         self.start_button.set_sensitive(not running)
@@ -555,16 +605,15 @@ class Window(Gtk.ApplicationWindow):
         self.hotspot_check.set_sensitive(not running)
         self.ssid_entry.set_sensitive(self.hotspot["enabled"] and not running)
         self.password_entry.set_sensitive(self.hotspot["enabled"] and not running)
-        if self.hotspot["enabled"]:
-            if not running:
-                stop_hotspot(self.hotspot)
-                status_text += f" Wi-Fi '{self.hotspot['ssid']}' removed."
-            else:
-                status_text += f" Wi-Fi '{self.hotspot['ssid']}' up."
+        if not running:
+            status_text += self._teardown_hotspot()
+        elif self.hotspot_up:
+            status_text += f" Wi-Fi '{self.hotspot['ssid']}' up."
         self.status_label.set_label(status_text)
 
     def _on_close_request(self, _window):
         self.controller.stop()
+        self._teardown_hotspot()
         return False
 
 
