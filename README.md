@@ -33,6 +33,8 @@ hotspot for the iPad to connect through — all from one small GTK4 window.
   D-Bus interfaces, and `gdctl` for monitor placement).
 - [**Sunshine**](https://github.com/LizardByte/Sunshine), installed as a
   Flatpak (`dev.lizardbyte.app.Sunshine`).
+- [**Moonlight**](https://moonlight-stream.org/) installed on the iPad (from
+  the App Store), to connect to Sunshine.
 - **NetworkManager** (`nmcli`) if you want the built-in Wi-Fi hotspot
   management; safe to leave disabled otherwise.
 - Python 3 with **PyGObject** (`gi`), GTK 4, and GStreamer with the PipeWire
