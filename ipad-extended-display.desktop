@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=iPad Extended Display
+Comment=Headless virtual display + Sunshine + Wi-Fi hotspot, sized for the iPad Mini
+Exec=AppRun
+Icon=ipad-extended-display
+Categories=Utility;
+Terminal=false
