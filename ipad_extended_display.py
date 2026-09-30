@@ -6,7 +6,9 @@ whatever's picked in the UI, defaulting to the iPad Mini's native panel, and
 placed left or right of your main display per the Position dropdown — via
 `gdctl set` once Mutter has auto-added it, since ScreenCast itself has no
 placement option), then — only once that display exists — (re)launches
-Sunshine (Flatpak), so it sees the new display. Stop runs in the reverse
+Sunshine (Flatpak), so it sees the new display. For "left", the move is
+held back until Sunshine's screen-share picker has been answered, so the
+picker opens on the main display (see start()). Stop runs in the reverse
 order: Sunshine is closed first, then the virtual display. Start also brings
 up the iPad's Wi-Fi hotspot (SSID/password editable in the window); Stop
 tears it back down and reconnects to your normal Wi-Fi. Closing the window
@@ -32,7 +34,7 @@ gi.require_version("Gst", "1.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, GLibUnix, Gst, Gtk
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 MUTTER_SC = "org.gnome.Mutter.ScreenCast"
 MUTTER_DC = "org.gnome.Mutter.DisplayConfig"
@@ -60,6 +62,10 @@ HOTSPOT_CON_NAME = "iPad"
 
 # How long after launch to check that Sunshine is still running.
 SUNSHINE_CHECK_SECS = 3
+# How often to check whether the screen-share picker has been answered, and
+# how long to wait for it before placing the virtual display anyway.
+PICKER_POLL_MS = 250
+PICKER_TIMEOUT_SECS = 180
 
 
 def sunshine_running():
@@ -219,24 +225,26 @@ class DisplayController:
             logical.append((x, y, scale, bool(primary), mons[0][0]))
         return monitors, logical
 
-    def _reposition_virtual(self, before, anchor, side, deadline):
-        """Poll until the new virtual monitor shows up in Mutter's display
-        config, then place it left/right of `anchor` — Mutter has already
-        auto-placed it somewhere (typically to the right) by the time it's
-        visible here, so this moves it. Positions are computed by hand
+    def _new_virtual(self, before):
+        """Connector of the new virtual monitor once it shows up in Mutter's
+        display config, else None."""
+        monitors, _ = self._display_state()
+        new = [c for c in monitors if c not in before and monitors[c][0] == VIRTUAL_PRODUCT]
+        return new[0] if new else None
+
+    def _place_virtual(self, connector, anchor, side):
+        """Place the virtual monitor left/right of `anchor` — Mutter has
+        already auto-placed it (typically to the right) by the time it's
+        visible, so this moves it. Positions are computed by hand
         rather than via gdctl's own --left-of/--right-of: asking gdctl to
         place a monitor left of one already sitting at x=0 makes it compute
         a negative x, which Mutter flatly rejects ("Invalid logical monitor
         position") — confirmed against a live session. Shifting the whole
         existing layout right by the new monitor's width instead keeps
         everything at x >= 0."""
-        if not anchor:
-            return False
+        if not anchor or not connector:
+            return
         monitors, logical = self._display_state()
-        new = [c for c in monitors if c not in before and monitors[c][0] == VIRTUAL_PRODUCT]
-        if not new:
-            return time.monotonic() < deadline
-        connector = new[0]
 
         by_connector = {con: (x, y, scale, primary) for x, y, scale, primary, con in logical}
         anchor_x, anchor_y, anchor_scale, _ = by_connector[anchor]
@@ -260,7 +268,12 @@ class DisplayController:
         args += ["--logical-monitor", "--monitor", connector,
                  "--x", str(round(new_v_x)), "--y", str(anchor_y), "--scale", str(v_scale)]
         subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return False
+
+    def _safe_place(self, connector, anchor, side):
+        try:
+            self._place_virtual(connector, anchor, side)
+        except Exception as exc:
+            print(f"Placing the virtual display failed: {exc}")
 
     def prepare_sunshine(self):
         """Close any running Sunshine and clear its cached screen-share
@@ -281,17 +294,39 @@ class DisplayController:
         subprocess.run(["flatpak", "permission-reset", SUNSHINE_APP_ID],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def _launch_sunshine(self, session, status):
+    def _launch_sunshine(self, session, status, place_after):
+        """Launch Sunshine, then wait for its screen-share picker to be
+        answered. `place_after` is a (connector, anchor, side) placement to
+        apply only once that has happened, or None."""
         if self.session != session:
             return  # stopped before the display was ready
         # `flatpak run` stays alive until the app exits, so this handle
         # tells us whether Sunshine is still running.
-        self.sunshine_proc = subprocess.Popen(
+        proc = self.sunshine_proc = subprocess.Popen(
             ["flatpak", "run", SUNSHINE_APP_ID],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True)
         GLib.timeout_add_seconds(SUNSHINE_CHECK_SECS, self._check_sunshine,
-                                 self.sunshine_proc, session, status)
+                                 proc, session, status)
+        self.on_state_change(True, f"{status} — choose the iPad display "
+                             "(Virtual remote monitor) in the screen-share window.")
+        # Sunshine writes its portal restore token (deleted in
+        # prepare_sunshine) as soon as the picker has been answered.
+        deadline = time.monotonic() + PICKER_TIMEOUT_SECS
+
+        def wait_for_picker():
+            if self.session != session or proc is not self.sunshine_proc \
+                    or proc.poll() is not None:
+                return False  # stopped, or _check_sunshine reports the exit
+            answered = os.path.exists(SUNSHINE_PORTAL_TOKEN)
+            if not answered and time.monotonic() < deadline:
+                return True
+            if place_after:
+                self._safe_place(*place_after)
+            self.on_state_change(True, status)
+            return False
+
+        GLib.timeout_add(PICKER_POLL_MS, wait_for_picker)
 
     def _check_sunshine(self, proc, session, status):
         if self.session != session or proc is not self.sunshine_proc:
@@ -328,7 +363,7 @@ class DisplayController:
         self.prepare_sunshine()
 
         # Snapshot the pre-existing monitors/primary now, before the virtual
-        # one exists, so _reposition_virtual can tell which one is new and
+        # one exists, so _new_virtual can tell which one is new and
         # what to place it relative to.
         before_monitors, before_logical = self._display_state()
         before = set(before_monitors)
@@ -355,20 +390,35 @@ class DisplayController:
             self.on_state_change(True, status)
             deadline = time.monotonic() + 10
 
-            # Place the virtual display, THEN launch Sunshine, so it sees
-            # the display in its final position.
-            def place_then_launch():
+            # Wait for the virtual display to exist, THEN launch Sunshine.
+            #
+            # Placing it on the LEFT shifts the whole existing layout right,
+            # but the mouse pointer keeps its coordinates — so it can end up
+            # on the (invisible) virtual display, and GNOME opens Sunshine's
+            # screen-share picker on the pointer's display, where it can't be
+            # seen. So for "left", keep Mutter's default placement (to the
+            # right, no shift) until the picker has been answered, and only
+            # then move it. "Right" doesn't shift anything, so place it first
+            # and Sunshine sees the final layout.
+            def wait_for_display():
                 if self.session != session:
                     return False
                 try:
-                    if self._reposition_virtual(before, anchor, position, deadline):
-                        return True  # display not visible yet — poll again
+                    connector = self._new_virtual(before)
                 except Exception as exc:
-                    print(f"Repositioning the virtual display failed: {exc}")
-                self._launch_sunshine(session, status)
+                    print(f"Reading the display config failed: {exc}")
+                    connector = None
+                if connector is None and time.monotonic() < deadline:
+                    return True  # display not visible yet — poll again
+                place_after = None
+                if position == "left":
+                    place_after = (connector, anchor, position)
+                else:
+                    self._safe_place(connector, anchor, position)
+                self._launch_sunshine(session, status, place_after)
                 return False
 
-            GLib.timeout_add(150, place_then_launch)
+            GLib.timeout_add(150, wait_for_display)
 
         def on_session_closed(*_args):
             self._reset()
