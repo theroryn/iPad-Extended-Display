@@ -5,7 +5,9 @@ Creates a headless virtual display via Mutter's ScreenCast API (sized to
 whatever's picked in the UI, defaulting to the iPad Mini's native panel, and
 placed left or right of your main display per the Position dropdown — via
 `gdctl set` once Mutter has auto-added it, since ScreenCast itself has no
-placement option), then (re)launches Sunshine (Flatpak). Start also brings
+placement option), then — only once that display exists — (re)launches
+Sunshine (Flatpak), so it sees the new display. Stop runs in the reverse
+order: Sunshine is closed first, then the virtual display. Start also brings
 up the iPad's Wi-Fi hotspot (SSID/password editable in the window); Stop
 tears it back down and reconnects to your normal Wi-Fi. Closing the window
 stops everything first.
@@ -30,7 +32,7 @@ gi.require_version("Gst", "1.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, GLibUnix, Gst, Gtk
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 MUTTER_SC = "org.gnome.Mutter.ScreenCast"
 MUTTER_DC = "org.gnome.Mutter.DisplayConfig"
@@ -55,6 +57,19 @@ HOTSPOT_FILE = os.path.join(CONFIG_DIR, "hotspot.json")
 DEFAULT_HOTSPOT = {"enabled": True, "ssid": "iPad", "password": "Padnet123",
                    "interface": "wlp0s20f3"}
 HOTSPOT_CON_NAME = "iPad"
+
+# How long after launch to check that Sunshine is still running.
+SUNSHINE_CHECK_SECS = 3
+
+
+def sunshine_running():
+    """True if a Sunshine Flatpak instance is running. Uses `flatpak ps`
+    rather than `pgrep -x sunshine` so it doesn't depend on the exact
+    process name inside the sandbox."""
+    apps = subprocess.run(["flatpak", "ps", "--columns=application"],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          text=True).stdout.split()
+    return SUNSHINE_APP_ID in apps
 
 
 def load_hotspot():
@@ -172,6 +187,7 @@ class DisplayController:
         self.on_state_change = on_state_change
         self.session = None
         self.pipeline = None
+        self.sunshine_proc = None
         self._sub_ids = []
 
     def _call(self, dest, path, iface, method, params=None, reply=None):
@@ -246,16 +262,18 @@ class DisplayController:
         subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return False
 
-    def ensure_sunshine_running(self):
-        # Always relaunch fresh so the permission reset below actually takes
-        # effect (an already-running Sunshine won't re-check permissions)
-        # and so it re-enumerates outputs and sees the new virtual display.
-        if subprocess.run(["pgrep", "-x", "sunshine"],
-                          stdout=subprocess.DEVNULL).returncode == 0:
-            subprocess.run(["flatpak", "kill", SUNSHINE_APP_ID],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(1)
+    def prepare_sunshine(self):
+        """Close any running Sunshine and clear its cached screen-share
+        consent, ready for a fresh launch once the virtual display exists.
+        Relaunching fresh is needed so the permission reset actually takes
+        effect (an already-running Sunshine won't re-check permissions) and
+        so it enumerates outputs with the new virtual display present.
 
+        Uses stop_sunshine(), which waits until the old instance has really
+        exited — a fixed sleep here let the new Sunshine start while the old
+        one still held its ports, so the new one quit straight away."""
+        if sunshine_running():
+            self.stop_sunshine()
         try:
             os.remove(SUNSHINE_PORTAL_TOKEN)
         except FileNotFoundError:
@@ -263,18 +281,41 @@ class DisplayController:
         subprocess.run(["flatpak", "permission-reset", SUNSHINE_APP_ID],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        subprocess.Popen(["flatpak", "run", SUNSHINE_APP_ID],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+    def _launch_sunshine(self, session, status):
+        if self.session != session:
+            return  # stopped before the display was ready
+        # `flatpak run` stays alive until the app exits, so this handle
+        # tells us whether Sunshine is still running.
+        self.sunshine_proc = subprocess.Popen(
+            ["flatpak", "run", SUNSHINE_APP_ID],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        GLib.timeout_add_seconds(SUNSHINE_CHECK_SECS, self._check_sunshine,
+                                 self.sunshine_proc, session, status)
+
+    def _check_sunshine(self, proc, session, status):
+        if self.session != session or proc is not self.sunshine_proc:
+            return False
+        if proc.poll() is not None:
+            self.on_state_change(
+                True, f"{status}, but Sunshine exited straight after launch "
+                "(see ~/.var/app/dev.lizardbyte.app.Sunshine/config/sunshine/"
+                "sunshine.log). Press Stop, then Start to retry.")
+        return False
 
     def stop_sunshine(self):
         subprocess.run(["flatpak", "kill", SUNSHINE_APP_ID],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(30):
-            if subprocess.run(["pgrep", "-x", "sunshine"],
-                              stdout=subprocess.DEVNULL).returncode != 0:
+            if not sunshine_running():
                 break
             time.sleep(0.1)
+        if self.sunshine_proc:
+            try:
+                self.sunshine_proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            self.sunshine_proc = None
         # xdg-desktop-portal tears down Sunshine's own (separate) portal
         # screen-cast session asynchronously after its bus connection drops.
         # Give that a moment to finish before we touch the virtual monitor.
@@ -283,7 +324,8 @@ class DisplayController:
     def start(self, width, height, position):
         if self.running:
             return
-        self.ensure_sunshine_running()
+        # Sunshine itself is launched later, once the virtual display exists.
+        self.prepare_sunshine()
 
         # Snapshot the pre-existing monitors/primary now, before the virtual
         # one exists, so _reposition_virtual can tell which one is new and
@@ -309,9 +351,24 @@ class DisplayController:
                 f"video/x-raw,width={width},height={height},max-framerate={FPS}/1 ! "
                 "fakesink sync=false")
             self.pipeline.set_state(Gst.State.PLAYING)
-            self.on_state_change(True, f"Active — {width}×{height}@{FPS}")
-            GLib.timeout_add(150, self._reposition_virtual, before, anchor, position,
-                             time.monotonic() + 10)
+            status = f"Active — {width}×{height}@{FPS}"
+            self.on_state_change(True, status)
+            deadline = time.monotonic() + 10
+
+            # Place the virtual display, THEN launch Sunshine, so it sees
+            # the display in its final position.
+            def place_then_launch():
+                if self.session != session:
+                    return False
+                try:
+                    if self._reposition_virtual(before, anchor, position, deadline):
+                        return True  # display not visible yet — poll again
+                except Exception as exc:
+                    print(f"Repositioning the virtual display failed: {exc}")
+                self._launch_sunshine(session, status)
+                return False
+
+            GLib.timeout_add(150, place_then_launch)
 
         def on_session_closed(*_args):
             self._reset()
