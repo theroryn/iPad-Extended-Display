@@ -30,6 +30,8 @@ gi.require_version("Gst", "1.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, GLibUnix, Gst, Gtk
 
+VERSION = "1.0.1"
+
 MUTTER_SC = "org.gnome.Mutter.ScreenCast"
 MUTTER_DC = "org.gnome.Mutter.DisplayConfig"
 VIRTUAL_PRODUCT = "Virtual remote monitor"
@@ -525,6 +527,13 @@ class Window(Gtk.ApplicationWindow):
 
         self.status_label = Gtk.Label(label="Stopped.", xalign=0, wrap=True)
         box.append(self.status_label)
+
+        # Small version tag, bottom-right corner.
+        version_label = Gtk.Label(label=f"v{VERSION}", halign=Gtk.Align.END,
+                                  valign=Gtk.Align.END, vexpand=True)
+        version_label.add_css_class("dim-label")
+        version_label.add_css_class("caption")
+        box.append(version_label)
 
         self.connect("close-request", self._on_close_request)
 

@@ -9,6 +9,14 @@ HERE="$(dirname "$(readlink -f "$0")")"
 BUILD="$(mktemp -d)"
 trap 'rm -rf "$BUILD"' EXIT
 
+# Single source of truth for the version: VERSION in ipad_extended_display.py.
+VERSION="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$HERE/ipad_extended_display.py")"
+if [ -z "$VERSION" ]; then
+    echo "Couldn't read VERSION from ipad_extended_display.py" >&2
+    exit 1
+fi
+APPIMAGE_NAME="iPad-Extended-Display-$VERSION-x86_64.AppImage"
+
 APPDIR="$BUILD/AppDir"
 mkdir -p "$APPDIR/usr/bin"
 cp "$HERE/AppRun" "$APPDIR/AppRun"
@@ -24,10 +32,10 @@ if [ ! -x "$APPIMAGETOOL" ]; then
     exit 1
 fi
 
-OUT="$HERE/iPad-Extended-Display-1.0.0-x86_64.AppImage"
+OUT="$HERE/$APPIMAGE_NAME"
 ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUT"
 
 mkdir -p "$HOME/Applications"
-cp "$OUT" "$HOME/Applications/iPad-Extended-Display-1.0.0-x86_64.AppImage"
-chmod +x "$HOME/Applications/iPad-Extended-Display-1.0.0-x86_64.AppImage"
-echo "Installed to $HOME/Applications/iPad-Extended-Display-1.0.0-x86_64.AppImage"
+cp "$OUT" "$HOME/Applications/$APPIMAGE_NAME"
+chmod +x "$HOME/Applications/$APPIMAGE_NAME"
+echo "Installed to $HOME/Applications/$APPIMAGE_NAME"
